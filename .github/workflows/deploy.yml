@@ -1,0 +1,116 @@
+# Despliegue automático de la API en Azure Container Apps
+# Se ejecuta en cada push a main (excepto si solo cambia index.html) o a mano desde la pestaña Actions
+# Crea la API con "az rest": funciona aunque Microsoft.App siga en "Registering"
+name: Desplegar API en Azure
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["index.html"]   # el frontend vive en Storage, no requiere reconstruir el Docker
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: rg-mlops-ean
+  ACR_NAME: acrmlopseaneroabau          # el único nombre que cambia cada estudiante
+  ENVIRONMENT: env-mlops-ean
+  APP_NAME: api-mlops-ean
+  API_VERSION: "2024-03-01"
+
+jobs:
+  desplegar:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Descarga el código del repositorio
+      - uses: actions/checkout@v4
+
+      # 2. Inicia sesión en Azure con la cuenta de servicio
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3. Construye la imagen Docker y la sube al Container Registry
+      - name: Construir y subir imagen
+        run: |
+          IMAGE="$ACR_NAME.azurecr.io/$APP_NAME:${GITHUB_SHA}"   # cada versión con la etiqueta del commit
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"                    # la deja disponible para los pasos siguientes
+          az acr login --name "$ACR_NAME"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      # 4. Crea o actualiza la API (PUT sirve para las dos cosas)
+      - name: Crear o actualizar la API
+        env:
+          DB_URL: ${{ secrets.DATABRICKS_URL }}
+          DB_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          set -e
+          SUB=$(az account show --query id -o tsv)
+          BASE="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App"
+          ENV_ID="/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/managedEnvironments/$ENVIRONMENT"
+          APP_URL="$BASE/containerApps/$APP_NAME?api-version=$API_VERSION"
+
+          # Región: la misma del Environment
+          LOCATION=$(az rest --method get --url "$BASE/managedEnvironments/$ENVIRONMENT?api-version=$API_VERSION" --query location -o tsv)
+          echo "Región del Environment: $LOCATION"
+
+          # Contraseña del registry (se oculta en los logs)
+          ACR_PASSWORD=$(az acr credential show -n "$ACR_NAME" --query "passwords[0].value" -o tsv)
+          echo "::add-mask::$ACR_PASSWORD"
+
+          # Arma la definición de la API en app.json
+          jq -n \
+            --arg loc "$LOCATION" --arg env "$ENV_ID" --arg image "$IMAGE" \
+            --arg server "$ACR_NAME.azurecr.io" --arg user "$ACR_NAME" --arg pass "$ACR_PASSWORD" \
+            --arg url "$DB_URL" --arg token "$DB_TOKEN" \
+            '{
+              location: $loc,
+              properties: {
+                environmentId: $env,
+                workloadProfileName: "Consumption",
+                configuration: {
+                  ingress: { external: true, targetPort: 8000 },
+                  registries: [ { server: $server, username: $user, passwordSecretRef: "acr-password" } ],
+                  secrets: [
+                    { name: "acr-password", value: $pass },
+                    { name: "databricks-url", value: $url },
+                    { name: "databricks-token", value: $token }
+                  ]
+                },
+                template: {
+                  containers: [ {
+                    name: "api",
+                    image: $image,
+                    resources: { cpu: 0.5, memory: "1Gi" },
+                    env: [
+                      { name: "DATABRICKS_URL", secretRef: "databricks-url" },
+                      { name: "DATABRICKS_TOKEN", secretRef: "databricks-token" }
+                    ]
+                  } ],
+                  scale: { minReplicas: 0, maxReplicas: 1 }
+                }
+              }
+            }' > app.json
+
+          # Envía la definición a Azure (crea la primera vez, actualiza las siguientes)
+          az rest --method put --url "$APP_URL" --body @app.json -o none
+          rm app.json
+
+          # Espera hasta que Azure termine (máximo 10 minutos)
+          for i in $(seq 1 60); do
+            STATE=$(az rest --method get --url "$APP_URL" --query properties.provisioningState -o tsv)
+            echo "Estado: $STATE"
+            if [ "$STATE" = "Succeeded" ]; then break; fi
+            if [ "$STATE" = "Failed" ]; then echo "El despliegue falló"; exit 1; fi
+            sleep 10
+          done
+          if [ "$STATE" != "Succeeded" ]; then echo "Tiempo de espera agotado"; exit 1; fi
+
+      # 5. Muestra la URL pública de la API
+      - name: URL de la API
+        run: |
+          SUB=$(az account show --query id -o tsv)
+          FQDN=$(az rest --method get \
+            --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$APP_NAME?api-version=$API_VERSION" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "API publicada en: https://$FQDN"
+          echo "Pruebe: https://$FQDN/health"
